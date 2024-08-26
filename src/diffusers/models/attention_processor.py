@@ -14,6 +14,9 @@
 import inspect
 import math
 from typing import Callable, List, Optional, Tuple, Union
+import numpy as np
+import os
+import uuid
 
 import torch
 import torch.nn.functional as F
@@ -21,7 +24,7 @@ from torch import nn
 
 from ..image_processor import IPAdapterMaskProcessor
 from ..utils import deprecate, logging
-from ..utils.import_utils import is_torch_npu_available, is_xformers_available
+from ..utils.import_utils import is_torch_npu_available, is_xformers_available, is_l3m_fp8_attn_available
 from ..utils.torch_utils import is_torch_version, maybe_allow_in_graph
 
 
@@ -2302,6 +2305,45 @@ class AttnProcessor2_0:
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
+        if is_l3m_fp8_attn_available():
+            from l3m.serve.libth_transformer.fp8_attn import (
+                collect_torch_attn_fp8_scale as _collect_torch_attn_fp8_scale,
+                unfused_qkv_attn_fp8 as _unfused_qkv_attn_fp8,
+            )
+
+            self.l3m_collect_fp8_attn_scale = _collect_torch_attn_fp8_scale
+            self.l3m_unfused_qkv_attn_fp8 = _unfused_qkv_attn_fp8
+            self.layer_id = 0
+            # TODO: Replace it with unique nn.module id for reuse
+            # self.uuid = str(uuid.uuid4())
+            # self.attn_scale_save_path = f"/tmp/l3m_static_quant/act_scales/{self.uuid}/"
+            # self.q_act_name = "q_dst"
+            # self.k_act_name = "k_dst"
+            # self.v_act_name = "v_dst"
+            # self.attn_out_act_name = "attn_out"
+            # self.q_transpose_dst_path = f"{self.attn_scale_save_path}{self.q_act_name}/{self.q_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
+            # self.k_transpose_dst_path = f"{self.attn_scale_save_path}{self.k_act_name}/{self.k_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
+            # self.v_transpose_dst_path = f"{self.attn_scale_save_path}{self.v_act_name}/{self.v_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
+            # self.attn_out_scale_path = f"{self.attn_scale_save_path}{self.attn_out_act_name}/{self.attn_out_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
+            # self.is_fp8_attn_scale_collected = os.path.isfile(self.q_transpose_dst_path) #q_transpose_dst_path exists
+            # if self.is_fp8_attn_scale_collected:
+            #     self.load_l3m_fp8_attn_scale()
+
+    # def is_fp8_attn_scale_collected(self):
+    #     return os.path.isfile(self.q_transpose_dst_path)
+
+    # def load_l3m_fp8_attn_scale(self):
+    #     self.q_transpose_dst_scale = torch.from_numpy(np.load(self.q_transpose_dst_path)).to(
+    #         self.device
+    #     )
+    #     self.k_transpose_dst_scale = torch.from_numpy(np.load(self.k_transpose_dst_path)).to(
+    #         self.device
+    #     )
+    #     self.v_transpose_dst_scale = torch.from_numpy(np.load(self.v_transpose_dst_path)).to(
+    #         self.device
+    #     )
+    #     self.attn_out_scale = torch.from_numpy(np.load(self.attn_out_scale_path)).to(self.device)
+
     def __call__(
         self,
         attn: Attention,
@@ -2352,24 +2394,73 @@ class AttnProcessor2_0:
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
 
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        skip_l3m_fp8_attn = (key.shape[1] != query.shape[1]) or head_dim > 256
 
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        if hasattr(self, "l3m_collect_fp8_attn_scale") and not skip_l3m_fp8_attn:
+            self.device = query.device
+            query_input_lengths = torch.tensor(
+                [query.shape[1]] * query.shape[0],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_input_lengths = torch.tensor(
+                [key.shape[1]] * key.shape[0],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            # self.l3m_collect_fp8_attn_scale(
+            #     query,
+            #     key,
+            #     value,
+            #     hidden_states,
+            #     attn.heads,
+            #     attn.heads,
+            #     self.layer_id,
+            #     self.attn_scale_save_path,
+            #     self.q_act_name,
+            #     self.k_act_name,
+            #     self.v_act_name,
+            #     self.attn_out_act_name,
+            # )
+            # self.load_l3m_fp8_attn_scale()
+            q_bias = k_bias = v_bias = torch.zeros(inner_dim, device=self.device, dtype=query.dtype)
+            num_group = (inner_dim + 127) // 128
+            self.q_transpose_dst_scale = self.k_transpose_dst_scale = self.v_transpose_dst_scale = self.attn_out_scale = torch.ones(num_group, device=self.device, dtype=query.dtype)
+            hidden_states = self.l3m_unfused_qkv_attn_fp8(
+                query,
+                key,
+                value,
+                q_bias,
+                k_bias,
+                v_bias,
+                self.q_transpose_dst_scale,
+                self.k_transpose_dst_scale,
+                self.v_transpose_dst_scale,
+                self.attn_out_scale,
+                query_input_lengths,
+                kv_input_lengths,
+                attn.heads,
+                attn.heads,
+            )
+        else:
+            query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
+            key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        # the output of sdp = (batch, num_heads, seq_len, head_dim)
-        # TODO: add support for attn.scale when we move to Torch 2.1
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
+            if attn.norm_q is not None:
+                query = attn.norm_q(query)
+            if attn.norm_k is not None:
+                key = attn.norm_k(key)
 
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-        hidden_states = hidden_states.to(query.dtype)
+            # the output of sdp = (batch, num_heads, seq_len, head_dim)
+            # TODO: add support for attn.scale when we move to Torch 2.1
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
+
+            hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+            hidden_states = hidden_states.to(query.dtype)
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
