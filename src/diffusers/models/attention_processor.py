@@ -2156,43 +2156,42 @@ class AttnProcessor2_0:
 
         if is_l3m_fp8_attn_available():
             from l3m.serve.libth_transformer.fp8_attn import (
-                collect_fp8_attn_scale as l3m_collect_fp8_attn_scale,
-                test_unfused_qkv_attn_fp8 as l3m_unfused_qkv_attn_fp8,
+                collect_torch_attn_fp8_scale as _collect_torch_attn_fp8_scale,
+                unfused_qkv_attn_fp8 as _unfused_qkv_attn_fp8,
             )
 
-            self.l3m_collect_fp8_attn_scale = l3m_collect_fp8_attn_scale
-            self.l3m_unfused_qkv_attn_fp8 = l3m_unfused_qkv_attn_fp8
+            self.l3m_collect_fp8_attn_scale = _collect_torch_attn_fp8_scale
+            self.l3m_unfused_qkv_attn_fp8 = _unfused_qkv_attn_fp8
             self.layer_id = 0
             # TODO: Replace it with unique nn.module id for reuse
-            self.uuid = str(uuid.uuid4())
-            self.attn_scale_save_path = f"/tmp/l3m_static_quant/act_scales/{self.uuid}/"
-            self.q_act_name = "q_dst"
-            self.k_act_name = "k_dst"
-            self.v_act_name = "v_dst"
-            self.attn_out_act_name = "attn_out"
-            self.q_transpose_dst_path = f"{self.attn_scale_save_path}{self.q_act_name}/{self.q_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
-            self.k_transpose_dst_path = f"{self.attn_scale_save_path}{self.k_act_name}/{self.k_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
-            self.v_transpose_dst_path = f"{self.attn_scale_save_path}{self.v_act_name}/{self.v_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
-            self.attn_out_scale_path = f"{self.attn_scale_save_path}{self.attn_out_act_name}/{self.attn_out_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
+            # self.uuid = str(uuid.uuid4())
+            # self.attn_scale_save_path = f"/tmp/l3m_static_quant/act_scales/{self.uuid}/"
+            # self.q_act_name = "q_dst"
+            # self.k_act_name = "k_dst"
+            # self.v_act_name = "v_dst"
+            # self.attn_out_act_name = "attn_out"
+            # self.q_transpose_dst_path = f"{self.attn_scale_save_path}{self.q_act_name}/{self.q_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
+            # self.k_transpose_dst_path = f"{self.attn_scale_save_path}{self.k_act_name}/{self.k_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
+            # self.v_transpose_dst_path = f"{self.attn_scale_save_path}{self.v_act_name}/{self.v_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
+            # self.attn_out_scale_path = f"{self.attn_scale_save_path}{self.attn_out_act_name}/{self.attn_out_act_name}_layer_{self.layer_id}_group_size_128_scales.npy"
             # self.is_fp8_attn_scale_collected = os.path.isfile(self.q_transpose_dst_path) #q_transpose_dst_path exists
             # if self.is_fp8_attn_scale_collected:
             #     self.load_l3m_fp8_attn_scale()
-            #     logger.info(f'load fp8_attn_scale finished. attn_scale_save_path={self.attn_scale_save_path}')
 
-    def is_fp8_attn_scale_collected(self):
-        return os.path.isfile(self.q_transpose_dst_path)
+    # def is_fp8_attn_scale_collected(self):
+    #     return os.path.isfile(self.q_transpose_dst_path)
 
-    def load_l3m_fp8_attn_scale(self):
-        self.q_transpose_dst_scale = torch.from_numpy(np.load(self.q_transpose_dst_path)).to(
-            self.device
-        )
-        self.k_transpose_dst_scale = torch.from_numpy(np.load(self.k_transpose_dst_path)).to(
-            self.device
-        )
-        self.v_transpose_dst_scale = torch.from_numpy(np.load(self.v_transpose_dst_path)).to(
-            self.device
-        )
-        self.attn_out_scale = torch.from_numpy(np.load(self.attn_out_scale_path)).to(self.device)
+    # def load_l3m_fp8_attn_scale(self):
+    #     self.q_transpose_dst_scale = torch.from_numpy(np.load(self.q_transpose_dst_path)).to(
+    #         self.device
+    #     )
+    #     self.k_transpose_dst_scale = torch.from_numpy(np.load(self.k_transpose_dst_path)).to(
+    #         self.device
+    #     )
+    #     self.v_transpose_dst_scale = torch.from_numpy(np.load(self.v_transpose_dst_path)).to(
+    #         self.device
+    #     )
+    #     self.attn_out_scale = torch.from_numpy(np.load(self.attn_out_scale_path)).to(self.device)
 
     def __call__(
         self,
@@ -2244,17 +2243,38 @@ class AttnProcessor2_0:
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
 
-        if key.shape[1] == query.shape[1] and hasattr(self, "l3m_collect_fp8_attn_scale") and self.is_fp8_attn_scale_collected():
-            # TODO: load attn scale in __init__
-            self.load_l3m_fp8_attn_scale()
-            logger.info(f'load fp8_attn_scale finished. attn_scale_save_path={self.attn_scale_save_path}')
-            input_length = torch.tensor(
+        skip_l3m_fp8_attn = (key.shape[1] != query.shape[1]) or head_dim > 256
+
+        if hasattr(self, "l3m_collect_fp8_attn_scale") and not skip_l3m_fp8_attn:
+            self.device = query.device
+            query_input_lengths = torch.tensor(
                 [query.shape[1]] * query.shape[0],
                 dtype=torch.int32,
                 device=self.device,
             )
+            kv_input_lengths = torch.tensor(
+                [key.shape[1]] * key.shape[0],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            # self.l3m_collect_fp8_attn_scale(
+            #     query,
+            #     key,
+            #     value,
+            #     hidden_states,
+            #     attn.heads,
+            #     attn.heads,
+            #     self.layer_id,
+            #     self.attn_scale_save_path,
+            #     self.q_act_name,
+            #     self.k_act_name,
+            #     self.v_act_name,
+            #     self.attn_out_act_name,
+            # )
+            # self.load_l3m_fp8_attn_scale()
             q_bias = k_bias = v_bias = torch.zeros(inner_dim, device=self.device, dtype=query.dtype)
-
+            num_group = (inner_dim + 127) // 128
+            self.q_transpose_dst_scale = self.k_transpose_dst_scale = self.v_transpose_dst_scale = self.attn_out_scale = torch.ones(num_group, device=self.device, dtype=query.dtype)
             hidden_states = self.l3m_unfused_qkv_attn_fp8(
                 query,
                 key,
@@ -2266,7 +2286,8 @@ class AttnProcessor2_0:
                 self.k_transpose_dst_scale,
                 self.v_transpose_dst_scale,
                 self.attn_out_scale,
-                input_length,
+                query_input_lengths,
+                kv_input_lengths,
                 attn.heads,
                 attn.heads,
             )
@@ -2289,57 +2310,6 @@ class AttnProcessor2_0:
 
             hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
             hidden_states = hidden_states.to(query.dtype)
-
-            if hasattr(self, "l3m_collect_fp8_attn_scale") and key.shape[2] == query.shape[2]:
-                self.device = query.device
-                def stack_qkv(q_src, k_src, v_src, q_bias=None, k_bias=None, v_bias=None):
-                    # q_src with shape [batch_size, n_head, q_seq_len, size_per_head]
-                    # k_src with shape [batch_size, n_kv_head, k_seq_len, size_per_head]
-                    # batch_size = q_src.shape[0]
-                    n_head = q_src.shape[1]
-                    n_kv_head = k_src.shape[1]
-                    q_seq_len = q_src.shape[2]
-                    k_seq_len = k_src.shape[2]
-                    size_per_head = q_src.shape[3]
-                    assert n_head == n_kv_head, f"{n_head=} does not match {n_kv_head=}"
-                    assert q_seq_len == k_seq_len, f"{q_seq_len=} does not match {k_seq_len=}"
-
-                    qkv_src = torch.cat([q_src, k_src, v_src], dim=1).transpose(1, 2)
-                    qkv_bias = None
-                    if q_bias:
-                        qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
-                    else:
-                        qkv_bias = torch.zeros(3 * n_head * size_per_head, device=self.device, dtype=q_src.dtype)
-                    return qkv_src, qkv_bias
-
-                qkv_src, qkv_bias = stack_qkv(
-                    query,
-                    key,
-                    value,
-                    None,
-                    None,
-                    None,
-                )
-                input_length = torch.tensor(
-                    [qkv_src.shape[1]] * qkv_src.shape[0],
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                self.l3m_collect_fp8_attn_scale(
-                    qkv_src,
-                    qkv_bias,
-                    input_length,
-                    attn.heads,
-                    attn.heads,
-                    self.layer_id,
-                    self.attn_scale_save_path,
-                    self.q_act_name,
-                    self.k_act_name,
-                    self.v_act_name,
-                    self.attn_out_act_name,
-                )
-                logger.info(f'l3m_collect_fp8_attn_scale finished. attn_scale_save_path={self.attn_scale_save_path}')
-
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
